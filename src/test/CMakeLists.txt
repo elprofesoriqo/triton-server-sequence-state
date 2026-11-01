@@ -84,6 +84,64 @@ set(
   ../triton_memory.h
 )
 
+# Sequence state snapshot
+add_executable(
+  sequence_state_snapshot_test
+  sequence_state_snapshot_test.cc
+  ../sequence_state.cc
+  ../sequence_state.h
+  ../sequence_state_snapshot.cc
+  ../sequence_state_snapshot.h
+  ${MEMORY_SRCS}
+  ${MEMORY_HDRS}
+  ${PINNED_MEMORY_MANAGER_SRCS}
+  ${PINNED_MEMORY_MANAGER_HDRS}
+)
+
+target_include_directories(
+  sequence_state_snapshot_test
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${GTEST_INCLUDE_DIRS}
+    ${Boost_INCLUDE_DIRS}
+)
+
+target_compile_definitions(
+  sequence_state_snapshot_test
+  PRIVATE TRITON_ENABLE_LOGGING=1
+)
+
+target_compile_options(
+  sequence_state_snapshot_test
+  PRIVATE
+    -Wall
+    -Wextra
+    -Wno-unused-parameter
+    -Wno-deprecated-declarations
+    -Wno-error=maybe-uninitialized
+    -Werror
+)
+
+target_link_libraries(
+  sequence_state_snapshot_test
+  PRIVATE
+    triton-common-error
+    triton-common-logging
+    triton-common-model-config
+    proto-library
+    GTest::gtest
+    GTest::gtest_main
+    protobuf::libprotobuf
+    dl
+    numa
+)
+
+install(
+  TARGETS sequence_state_snapshot_test
+  RUNTIME DESTINATION bin
+)
+
 #
 # Unit test for TritonCache
 #
