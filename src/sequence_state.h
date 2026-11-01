@@ -66,13 +66,14 @@ class SequenceState {
 
   // The data for this shape.
   std::shared_ptr<Memory>& Data() { return data_; }
+  const std::shared_ptr<Memory>& Data() const { return data_; }
 
   // A boolean indicating whether a single buffer is used for both input or
   // output state or not.
-  bool UseSingleBuffer() { return use_single_buffer_; }
+  bool UseSingleBuffer() const { return use_single_buffer_; }
 
   // Use growable memory or not
-  bool UseGrowableMemory() { return use_growable_memory_; }
+  bool UseGrowableMemory() const { return use_growable_memory_; }
 
   // Set pointer to the other sequence state
   void SetOtherState(SequenceState* other) { other_state_ = other; }
@@ -85,6 +86,7 @@ class SequenceState {
   // For input state this would point to the output state. For output state this
   // would point to the input state.
   SequenceState* OtherState() { return other_state_; }
+  const SequenceState* OtherState() const { return other_state_; }
 
   // Set the data for this shape. Error if state already has some
   // data.
@@ -170,7 +172,19 @@ class SequenceStates {
     return input_states_;
   }
 
+  const std::map<std::string, std::shared_ptr<SequenceState>>& InputStates()
+      const
+  {
+    return input_states_;
+  }
+
   std::map<std::string, std::shared_ptr<SequenceState>>& OutputStates()
+  {
+    return output_states_;
+  }
+
+  const std::map<std::string, std::shared_ptr<SequenceState>>& OutputStates()
+      const
   {
     return output_states_;
   }
