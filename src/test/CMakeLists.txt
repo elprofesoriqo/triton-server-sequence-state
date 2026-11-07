@@ -84,12 +84,15 @@ set(
   ../triton_memory.h
 )
 
-# Sequence state snapshot
+# Sequence state checkpointing
 add_executable(
   sequence_state_snapshot_test
+  sequence_state_checkpoint_store_test.cc
   sequence_state_snapshot_test.cc
   ../sequence_state.cc
   ../sequence_state.h
+  ../sequence_state_checkpoint_store.cc
+  ../sequence_state_checkpoint_store.h
   ../sequence_state_snapshot.cc
   ../sequence_state_snapshot.h
   ${MEMORY_SRCS}
@@ -129,6 +132,7 @@ target_link_libraries(
     triton-common-error
     triton-common-logging
     triton-common-model-config
+    Crc32c::crc32c
     proto-library
     GTest::gtest
     GTest::gtest_main
