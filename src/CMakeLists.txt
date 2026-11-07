@@ -151,6 +151,7 @@ set(
   sequence_batch_scheduler/sequence_batch_scheduler.cc
   sequence_batch_scheduler/sequence_utils.cc
   sequence_state.cc
+  sequence_state_checkpoint_store.cc
   sequence_state_snapshot.cc
   server.cc
   shared_library.cc
@@ -202,6 +203,7 @@ set(
   sequence_batch_scheduler/sequence_batch_scheduler.h
   sequence_batch_scheduler/sequence_utils.h
   sequence_state.h
+  sequence_state_checkpoint_store.h
   sequence_state_snapshot.h
   server.h
   server_message.h
@@ -440,12 +442,14 @@ ENDFOREACH(p)
 # re2 requires Threads::Threads to be available in the
 # list of targets
 find_package(Threads)
+find_package(Crc32c REQUIRED)
 find_package(re2 REQUIRED)
 
 target_link_libraries(
   triton-core
   PRIVATE
     proto-library                    # from repo-common
+    Crc32c::crc32c
     triton-common-async-work-queue   # from repo-common
     triton-common-thread-pool        # from repo-common
     triton-common-error              # from repo-common

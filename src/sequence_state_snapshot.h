@@ -34,6 +34,8 @@
 
 namespace triton { namespace core {
 
+class SequenceStateCheckpointStore;
+
 class SequenceStateSnapshot {
  public:
   struct Tensor {
@@ -53,6 +55,8 @@ class SequenceStateSnapshot {
   const std::vector<char>& Data() const { return data_; }
 
  private:
+  friend class SequenceStateCheckpointStore;
+
   std::vector<Tensor> tensors_;
   std::vector<char> data_;
 };
