@@ -1453,27 +1453,25 @@ TRITONBACKEND_StateBuffer(
     TRITONSERVER_MemoryType* memory_type, int64_t* memory_type_id)
 {
   SequenceState* to = reinterpret_cast<SequenceState*>(state);
-  Status status = Status::Success;
 
   TRITONSERVER_MemoryType current_memory_type;
   int64_t current_memory_type_id;
-  void* lbuffer = nullptr;
-  MutableMemory* mutable_memory =
-      reinterpret_cast<MutableMemory*>(to->Data().get());
-  lbuffer = mutable_memory->MutableBuffer(
-      &current_memory_type, &current_memory_type_id);
-
   // If the buffer size exactly matches the buffer available and is requesting
   // the same memory type and memory type id, reuse the currently allocated
   // buffer.
-  if (to->Data()->TotalByteSize() == buffer_byte_size &&
-      current_memory_type == *memory_type &&
-      current_memory_type_id == *memory_type_id) {
-    *buffer = lbuffer;
-  } else {
-    RETURN_TRITONSERVER_ERROR_IF_ERROR(to->ResizeOrReallocate(
-        buffer, buffer_byte_size, memory_type, memory_type_id));
+  if ((to->Data()->BufferCount() != 0) &&
+      (to->Data()->TotalByteSize() == buffer_byte_size)) {
+    auto* mutable_memory = reinterpret_cast<MutableMemory*>(to->Data().get());
+    void* existing = mutable_memory->MutableBuffer(
+        &current_memory_type, &current_memory_type_id);
+    if ((current_memory_type == *memory_type) &&
+        (current_memory_type_id == *memory_type_id)) {
+      *buffer = existing;
+      return nullptr;
+    }
   }
+  RETURN_TRITONSERVER_ERROR_IF_ERROR(to->ResizeOrReallocate(
+      buffer, buffer_byte_size, memory_type, memory_type_id));
 
   return nullptr;  // success
 }
