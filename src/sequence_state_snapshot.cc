@@ -136,7 +136,8 @@ struct RestoreTarget {
 
 Status
 SequenceStateSnapshot::Capture(
-    const SequenceStates& states, SequenceStateSnapshot* snapshot)
+    const SequenceStates& states, SequenceStateSnapshot* snapshot,
+    const std::vector<Tensor>* expected_layout)
 {
   if (snapshot == nullptr) {
     return InvalidSnapshot("output must not be null");
@@ -155,13 +156,16 @@ SequenceStateSnapshot::Capture(
       return InvalidSnapshot("total state size exceeds the addressable range");
     }
 
-    captured.tensors_.emplace_back(
-        Tensor{
-            state->Name(), state->DType(), state->Shape(), total_byte_size,
-            byte_size});
+    captured.tensors_.emplace_back(Tensor{
+        state->Name(), state->DType(), state->Shape(), total_byte_size,
+        byte_size});
     total_byte_size += byte_size;
   }
 
+  if ((expected_layout != nullptr) && (captured.tensors_ != *expected_layout)) {
+    return InvalidSnapshot(
+        "live state layout differs from the configured layout");
+  }
   captured.data_.resize(total_byte_size);
   size_t index = 0;
   for (const auto& state_entry : states.InputStates()) {

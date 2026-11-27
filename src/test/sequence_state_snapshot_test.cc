@@ -225,6 +225,13 @@ TEST_F(SequenceStateSnapshotTest, RejectsDifferentLayout)
   SequenceStates target;
   ASSERT_TRUE(InitializeStates(target_config, &target).IsOk());
   EXPECT_EQ(snapshot.Restore(&target).StatusCode(), Status::Code::INVALID_ARG);
+  SequenceStateSnapshot captured;
+  EXPECT_EQ(
+      SequenceStateSnapshot::Capture(target, &captured, &snapshot.Tensors())
+          .StatusCode(),
+      Status::Code::INVALID_ARG);
+  EXPECT_TRUE(captured.Data().empty());
+  EXPECT_TRUE(captured.Tensors().empty());
 }
 
 }}}  // namespace triton::core

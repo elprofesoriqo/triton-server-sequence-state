@@ -44,10 +44,17 @@ class SequenceStateSnapshot {
     std::vector<int64_t> shape_;
     size_t offset_;
     size_t byte_size_;
+    bool operator==(const Tensor& other) const
+    {
+      return (input_name_ == other.input_name_) &&
+             (datatype_ == other.datatype_) && (shape_ == other.shape_) &&
+             (offset_ == other.offset_) && (byte_size_ == other.byte_size_);
+    }
   };
 
   static Status Capture(
-      const SequenceStates& states, SequenceStateSnapshot* snapshot);
+      const SequenceStates& states, SequenceStateSnapshot* snapshot,
+      const std::vector<Tensor>* expected_layout = nullptr);
 
   Status Restore(SequenceStates* states) const;
 

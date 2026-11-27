@@ -375,4 +375,63 @@ TEST_F(SequenceStateCheckpointStoreTest, JoinsConcurrentShutdown)
   EXPECT_EQ(completed[1], 16);
 }
 
+TEST_F(SequenceStateCheckpointStoreTest, RecoversBoundedExclusiveCatalog)
+{
+  ASSERT_TRUE(store_->Save("valid", Snapshot()).IsOk());
+  std::ofstream(Path("broken"), std::ios::binary) << "incomplete";
+  std::ofstream(std::filesystem::path(directory_) / ".tmp-interrupted")
+      << "partial";
+  std::ofstream(std::filesystem::path(directory_) / ".tmp-123-4") << "partial";
+  std::vector<SequenceStateCheckpointStore::Checkpoint> recovered;
+  size_t count = 0;
+  size_t bytes = 0;
+  ASSERT_TRUE(
+      store_->Recover(8, 1024 * 1024, &recovered, &count, &bytes).IsOk());
+  ASSERT_EQ(recovered.size(), 1);
+  EXPECT_EQ(recovered.front().sequence_id_, "valid");
+  EXPECT_EQ(count, 2);
+  EXPECT_EQ(bytes, std::filesystem::file_size(Path("valid")) + 10);
+  EXPECT_TRUE(std::filesystem::exists(
+      std::filesystem::path(directory_) / ".tmp-interrupted"));
+  EXPECT_FALSE(std::filesystem::exists(
+      std::filesystem::path(directory_) / ".tmp-123-4"));
+  auto incompatible_layout = Snapshot().Tensors();
+  incompatible_layout.front().shape_ = {3};
+  ASSERT_TRUE(
+      store_
+          ->Recover(
+              8, 1024 * 1024, &recovered, &count, &bytes, &incompatible_layout)
+          .IsOk());
+  EXPECT_TRUE(recovered.empty());
+  EXPECT_EQ(count, 2);
+  std::unique_ptr<SequenceStateCheckpointStore> other;
+  ASSERT_TRUE(SequenceStateCheckpointStore::Create(
+                  directory_, "counter", 1, 1024 * 1024, &other)
+                  .IsOk());
+  EXPECT_FALSE(
+      other->Recover(8, 1024 * 1024, &recovered, &count, &bytes).IsOk());
+  EXPECT_EQ(
+      store_->Recover(1, 1024 * 1024, &recovered, &count, &bytes).StatusCode(),
+      Status::Code::UNAVAILABLE);
+  store_.reset();
+  EXPECT_TRUE(
+      other->Recover(8, 1024 * 1024, &recovered, &count, &bytes).IsOk());
+}
+
+TEST_F(SequenceStateCheckpointStoreTest, WaitsForOwnedCompletion)
+{
+  std::unique_ptr<SequenceStateCheckpointExecutor> executor;
+  ASSERT_TRUE(SequenceStateCheckpointExecutor::Create(
+                  std::move(store_), {1, 2, 1024 * 1024}, &executor)
+                  .IsOk());
+  SequenceStateCheckpointExecutor::Completion completion;
+  EXPECT_FALSE(executor->WaitCompletion("missing", &completion));
+  ASSERT_TRUE(executor->SubmitSave("42", Snapshot()).IsOk());
+  ASSERT_TRUE(executor->WaitCompletion("42", &completion));
+  EXPECT_TRUE(completion.status_.IsOk());
+  EXPECT_EQ(completion.sequence_id_, "42");
+  EXPECT_EQ(executor->GetStatistics().reserved_byte_size_, 0);
+  EXPECT_FALSE(executor->WaitCompletion("42", &completion));
+}
+
 }}}  // namespace triton::core

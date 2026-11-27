@@ -26,7 +26,9 @@
 
 #include "sequence_state_checkpoint_store.h"
 
+#include <dirent.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -399,6 +401,103 @@ SequenceStateCheckpointStore::~SequenceStateCheckpointStore()
 }
 
 Status
+SequenceStateCheckpointStore::Recover(
+    size_t max_count, size_t max_bytes, std::vector<Checkpoint>* checkpoints,
+    size_t* occupied_count, size_t* occupied_bytes,
+    const std::vector<SequenceStateSnapshot::Tensor>* expected_layout)
+{
+  if (flock(directory_fd_, LOCK_EX | LOCK_NB) != 0) {
+    return SystemError("lock checkpoint directory", errno);
+  }
+  const int fd = openat(directory_fd_, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    return SystemError("open checkpoint catalog", errno);
+  }
+  auto close_directory = [](DIR* directory) { closedir(directory); };
+  std::unique_ptr<DIR, decltype(close_directory)> directory(
+      fdopendir(fd), close_directory);
+  if (directory == nullptr) {
+    close(fd);
+    return SystemError("read checkpoint catalog", errno);
+  }
+  checkpoints->clear();
+  *occupied_count = 0;
+  *occupied_bytes = 0;
+  for (;;) {
+    errno = 0;
+    const auto* entry = readdir(directory.get());
+    if (entry == nullptr) {
+      return errno == 0 ? Status::Success
+                        : SystemError("scan checkpoints", errno);
+    }
+    const std::string name(entry->d_name);
+    if (name.compare(0, 5, ".tmp-") == 0) {
+      const auto separator = name.find('-', 5);
+      const auto digits = [](char c) { return (c >= '0') && (c <= '9'); };
+      if ((separator != std::string::npos) && (separator > 5) &&
+          (separator + 1 < name.size()) &&
+          std::all_of(name.begin() + 5, name.begin() + separator, digits) &&
+          std::all_of(name.begin() + separator + 1, name.end(), digits)) {
+        struct stat temporary;
+        if (fstatat(
+                directory_fd_, name.c_str(), &temporary, AT_SYMLINK_NOFOLLOW) !=
+            0) {
+          return SystemError("inspect temporary checkpoint", errno);
+        }
+        if (S_ISREG(temporary.st_mode)) {
+          if ((unlinkat(directory_fd_, name.c_str(), 0) != 0) ||
+              (fsync(directory_fd_) != 0)) {
+            return SystemError("remove stale temporary checkpoint", errno);
+          }
+        }
+      }
+      continue;
+    }
+    if ((name.size() <= 9) || (name.compare(0, 4, "seq-") != 0) ||
+        (name.compare(name.size() - 5, 5, ".ckpt") != 0)) {
+      continue;
+    }
+    struct stat info;
+    if (fstatat(directory_fd_, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) != 0) {
+      return SystemError("inspect checkpoint catalog entry", errno);
+    }
+    if (!S_ISREG(info.st_mode)) {
+      continue;
+    }
+    if ((*occupied_count >= max_count) || (info.st_size < 0) ||
+        (uint64_t(info.st_size) > max_bytes - *occupied_bytes)) {
+      return StoreError(
+          Status::Code::UNAVAILABLE, "stored checkpoint limit exceeded");
+    }
+    ++*occupied_count;
+    *occupied_bytes += size_t(info.st_size);
+    std::string id;
+    bool valid = ((name.size() - 9) % 2) == 0;
+    for (size_t i = 4; valid && (i < name.size() - 5); i += 2) {
+      const char* high = std::strchr(kHex, name[i]);
+      const char* low = std::strchr(kHex, name[i + 1]);
+      valid = (high != nullptr) && (low != nullptr);
+      if (valid) {
+        id.push_back(char(((high - kHex) << 4) | (low - kHex)));
+      }
+    }
+    if (valid) {
+      SequenceStateSnapshot snapshot;
+      size_t bytes = 0;
+      const auto status = Load(id, &snapshot, &bytes);
+      if (status.IsOk()) {
+        if ((expected_layout == nullptr) ||
+            (snapshot.Tensors() == *expected_layout)) {
+          checkpoints->push_back({std::move(id), bytes});
+        }
+      } else if (status.StatusCode() != Status::Code::INVALID_ARG) {
+        return status;
+      }
+    }
+  }
+}
+
+Status
 SequenceStateCheckpointStore::CheckpointName(
     const std::string& sequence_id, std::string* name) const
 {
@@ -427,6 +526,31 @@ SequenceStateCheckpointStore::CheckpointName(
 }
 
 Status
+SequenceStateCheckpointStore::CheckpointByteSize(
+    const std::string& sequence_id, const SequenceStateSnapshot& snapshot,
+    size_t* byte_size) const
+{
+  if (byte_size == nullptr) {
+    return StoreError(
+        Status::Code::INVALID_ARG, "checkpoint size output is null");
+  }
+  std::string name;
+  RETURN_IF_ERROR(CheckpointName(sequence_id, &name));
+  size_t metadata_byte_size = 0;
+  RETURN_IF_ERROR(SnapshotMetadataSize(
+      snapshot, sequence_id, model_name_, &metadata_byte_size));
+  size_t total = kHeaderByteSize;
+  if (!AddSize(total, metadata_byte_size, &total) ||
+      !AddSize(total, snapshot.Data().size(), &total) ||
+      (total > max_checkpoint_byte_size_)) {
+    return StoreError(
+        Status::Code::INVALID_ARG, "checkpoint exceeds the configured limit");
+  }
+  *byte_size = total;
+  return Status::Success;
+}
+
+Status
 SequenceStateCheckpointStore::Save(
     const std::string& sequence_id, const SequenceStateSnapshot& snapshot,
     size_t* checkpoint_byte_size) const
@@ -434,16 +558,10 @@ SequenceStateCheckpointStore::Save(
   std::string checkpoint_name;
   RETURN_IF_ERROR(CheckpointName(sequence_id, &checkpoint_name));
 
-  size_t metadata_byte_size = 0;
-  RETURN_IF_ERROR(SnapshotMetadataSize(
-      snapshot, sequence_id, model_name_, &metadata_byte_size));
-  size_t total_byte_size = kHeaderByteSize;
-  if (!AddSize(total_byte_size, metadata_byte_size, &total_byte_size) ||
-      !AddSize(total_byte_size, snapshot.Data().size(), &total_byte_size) ||
-      (total_byte_size > max_checkpoint_byte_size_)) {
-    return StoreError(
-        Status::Code::INVALID_ARG, "checkpoint exceeds the configured limit");
-  }
+  size_t total_byte_size = 0;
+  RETURN_IF_ERROR(CheckpointByteSize(sequence_id, snapshot, &total_byte_size));
+  const size_t metadata_byte_size =
+      total_byte_size - kHeaderByteSize - snapshot.Data().size();
 
   std::vector<char> metadata;
   metadata.reserve(metadata_byte_size);

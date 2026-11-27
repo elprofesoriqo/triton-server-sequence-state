@@ -204,6 +204,33 @@ SequenceStateCheckpointExecutor::FinishJob(
           operation, std::move(sequence_id), status, std::move(snapshot),
           checkpoint_byte_size, durability_uncertain},
       reserved_byte_size});
+  completion_cv_.notify_all();
+}
+
+bool
+SequenceStateCheckpointExecutor::WaitCompletion(
+    const std::string& sequence_id, Completion* completion)
+{
+  if (completion == nullptr) {
+    return false;
+  }
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (;;) {
+    for (auto it = completions_.begin(); it != completions_.end(); ++it) {
+      if (it->completion_.sequence_id_ == sequence_id) {
+        reserved_byte_size_ -= it->reserved_byte_size_;
+        completion_byte_size_ -= it->reserved_byte_size_;
+        pending_sequences_.erase(sequence_id);
+        *completion = std::move(it->completion_);
+        completions_.erase(it);
+        return true;
+      }
+    }
+    if (pending_sequences_.find(sequence_id) == pending_sequences_.end()) {
+      return false;
+    }
+    completion_cv_.wait(lock);
+  }
 }
 
 bool
@@ -222,6 +249,7 @@ SequenceStateCheckpointExecutor::PopCompletion(Completion* completion)
   pending_sequences_.erase(completions_.front().completion_.sequence_id_);
   *completion = std::move(completions_.front().completion_);
   completions_.pop_front();
+  completion_cv_.notify_all();
   return true;
 }
 

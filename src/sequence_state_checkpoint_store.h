@@ -37,12 +37,24 @@ namespace triton { namespace core {
 
 class SequenceStateCheckpointStore {
  public:
+  struct Checkpoint {
+    std::string sequence_id_;
+    size_t byte_size_;
+  };
+  Status Recover(
+      size_t max_count, size_t max_bytes, std::vector<Checkpoint>* checkpoints,
+      size_t* occupied_count, size_t* occupied_bytes,
+      const std::vector<SequenceStateSnapshot::Tensor>* expected_layout =
+          nullptr);
   static Status Create(
       const std::string& directory, const std::string& model_name,
       int64_t model_version, size_t max_checkpoint_byte_size,
       std::unique_ptr<SequenceStateCheckpointStore>* store);
 
   ~SequenceStateCheckpointStore();
+  Status CheckpointByteSize(
+      const std::string& sequence_id, const SequenceStateSnapshot& snapshot,
+      size_t* byte_size) const;
 
   SequenceStateCheckpointStore(const SequenceStateCheckpointStore&) = delete;
   SequenceStateCheckpointStore& operator=(const SequenceStateCheckpointStore&) =

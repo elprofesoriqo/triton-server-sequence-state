@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -56,8 +57,8 @@ class SequenceStateCheckpointExecutor {
     std::string sequence_id_;
     Status status_;
     std::unique_ptr<SequenceStateSnapshot> snapshot_;
-    size_t checkpoint_byte_size_;
-    bool durability_uncertain_;
+    size_t checkpoint_byte_size_{0};
+    bool durability_uncertain_{false};
   };
 
   struct Statistics {
@@ -90,6 +91,7 @@ class SequenceStateCheckpointExecutor {
   Status SubmitRemove(std::string sequence_id);
 
   bool PopCompletion(Completion* completion);
+  bool WaitCompletion(const std::string& sequence_id, Completion* completion);
   Statistics GetStatistics() const;
   void Shutdown();
 
@@ -118,6 +120,7 @@ class SequenceStateCheckpointExecutor {
   const size_t max_reserved_byte_size_;
 
   mutable std::mutex mutex_;
+  std::condition_variable completion_cv_;
   std::mutex shutdown_mutex_;
   std::unordered_set<std::string> pending_sequences_;
   std::unordered_map<std::string, size_t> stored_checkpoints_;
