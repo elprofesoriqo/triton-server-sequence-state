@@ -91,6 +91,8 @@ add_executable(
   sequence_state_snapshot_test.cc
   ../sequence_state.cc
   ../sequence_state.h
+  ../sequence_state_checkpoint_executor.cc
+  ../sequence_state_checkpoint_executor.h
   ../sequence_state_checkpoint_store.cc
   ../sequence_state_checkpoint_store.h
   ../sequence_state_snapshot.cc
@@ -132,6 +134,7 @@ target_link_libraries(
     triton-common-error
     triton-common-logging
     triton-common-model-config
+    triton-common-thread-pool
     Crc32c::crc32c
     proto-library
     GTest::gtest

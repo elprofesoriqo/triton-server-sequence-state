@@ -24,20 +24,21 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "sequence_state_checkpoint_store.h"
-
 #include <unistd.h>
 
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "gtest/gtest.h"
 #include "pinned_memory_manager.h"
+#include "sequence_state_checkpoint_executor.h"
 #include "triton_memory.h"
 
 namespace triton { namespace core { namespace {
@@ -100,6 +101,22 @@ CheckpointName(const std::string& sequence_id)
     name.push_back(hex[byte & 0x0f]);
   }
   return name + ".ckpt";
+}
+
+bool
+WaitForCompletion(
+    SequenceStateCheckpointExecutor* executor,
+    SequenceStateCheckpointExecutor::Completion* completion)
+{
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (executor->PopCompletion(completion)) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
 }
 
 class SequenceStateCheckpointStoreTest : public ::testing::Test {
@@ -197,10 +214,9 @@ TEST_F(SequenceStateCheckpointStoreTest, ValidatesIdentityAndRemoval)
   ASSERT_TRUE(store_->Save("7", Snapshot()).IsOk());
 
   std::unique_ptr<SequenceStateCheckpointStore> incompatible;
-  ASSERT_TRUE(
-      SequenceStateCheckpointStore::Create(
-          directory_, "other-model", 1, 1024 * 1024, &incompatible)
-          .IsOk());
+  ASSERT_TRUE(SequenceStateCheckpointStore::Create(
+                  directory_, "other-model", 1, 1024 * 1024, &incompatible)
+                  .IsOk());
   SequenceStateSnapshot loaded;
   EXPECT_EQ(
       incompatible->Load("7", &loaded).StatusCode(), Status::Code::INVALID_ARG);
@@ -221,6 +237,142 @@ TEST_F(SequenceStateCheckpointStoreTest, RejectsSymlink)
   SequenceStateSnapshot loaded;
   EXPECT_NE(store_->Load("link", &loaded).StatusCode(), Status::Code::SUCCESS);
   EXPECT_EQ(store_->Remove("link").StatusCode(), Status::Code::INVALID_ARG);
+}
+
+TEST_F(SequenceStateCheckpointStoreTest, ExecutesBoundedCheckpointJobs)
+{
+  std::unique_ptr<SequenceStateCheckpointExecutor> executor;
+  ASSERT_TRUE(SequenceStateCheckpointExecutor::Create(
+                  std::move(store_), {1, 1, 1024 * 1024}, &executor)
+                  .IsOk());
+
+  ASSERT_TRUE(executor->SubmitSave("42", Snapshot()).IsOk());
+  EXPECT_EQ(
+      executor->SubmitSave("43", Snapshot()).StatusCode(),
+      Status::Code::UNAVAILABLE);
+
+  SequenceStateCheckpointExecutor::Completion completion;
+  ASSERT_TRUE(WaitForCompletion(executor.get(), &completion));
+  ASSERT_TRUE(completion.status_.IsOk()) << completion.status_.Message();
+  EXPECT_EQ(
+      completion.operation_, SequenceStateCheckpointExecutor::Operation::SAVE);
+  EXPECT_GT(completion.checkpoint_byte_size_, 0);
+  auto statistics = executor->GetStatistics();
+  EXPECT_EQ(statistics.queued_byte_size_, 0);
+  EXPECT_EQ(statistics.active_byte_size_, 0);
+  EXPECT_EQ(statistics.completion_byte_size_, 0);
+  EXPECT_EQ(statistics.reserved_byte_size_, 0);
+  EXPECT_EQ(statistics.stored_byte_size_, completion.checkpoint_byte_size_);
+
+  ASSERT_TRUE(executor->SubmitLoad("42").IsOk());
+  ASSERT_TRUE(WaitForCompletion(executor.get(), &completion));
+  ASSERT_TRUE(completion.status_.IsOk()) << completion.status_.Message();
+  ASSERT_NE(completion.snapshot_, nullptr);
+  SequenceStates restored;
+  ASSERT_TRUE(InitializeStates(&restored).IsOk());
+  ASSERT_TRUE(completion.snapshot_->Restore(&restored).IsOk());
+  EXPECT_EQ(Values(restored), (std::vector<int32_t>{4, 7}));
+
+  ASSERT_TRUE(executor->SubmitRemove("42").IsOk());
+  ASSERT_TRUE(WaitForCompletion(executor.get(), &completion));
+  ASSERT_TRUE(completion.status_.IsOk()) << completion.status_.Message();
+  EXPECT_EQ(executor->GetStatistics().stored_byte_size_, 0);
+}
+
+TEST_F(SequenceStateCheckpointStoreTest, EnforcesByteLimitAndShutdown)
+{
+  std::unique_ptr<SequenceStateCheckpointExecutor> limited;
+  ASSERT_TRUE(SequenceStateCheckpointExecutor::Create(
+                  std::move(store_), {1, 1, 1}, &limited)
+                  .IsOk());
+  EXPECT_EQ(
+      limited->SubmitSave("42", Snapshot()).StatusCode(),
+      Status::Code::UNAVAILABLE);
+  EXPECT_EQ(limited->GetStatistics().queued_job_count_, 0);
+
+  limited->Shutdown();
+  EXPECT_EQ(
+      limited->SubmitRemove("42").StatusCode(), Status::Code::UNAVAILABLE);
+
+  std::unique_ptr<SequenceStateCheckpointStore> store;
+  ASSERT_TRUE(SequenceStateCheckpointStore::Create(
+                  directory_, "counter", 1, 1024 * 1024, &store)
+                  .IsOk());
+  std::unique_ptr<SequenceStateCheckpointExecutor> executor;
+  ASSERT_TRUE(SequenceStateCheckpointExecutor::Create(
+                  std::move(store), {1, 1, 1024 * 1024}, &executor)
+                  .IsOk());
+  ASSERT_TRUE(executor->SubmitSave("shutdown", Snapshot()).IsOk());
+  executor->Shutdown();
+  SequenceStateCheckpointExecutor::Completion completion;
+  ASSERT_TRUE(executor->PopCompletion(&completion));
+  EXPECT_TRUE(completion.status_.IsOk()) << completion.status_.Message();
+  EXPECT_EQ(
+      executor->SubmitRemove("shutdown").StatusCode(),
+      Status::Code::UNAVAILABLE);
+}
+
+TEST_F(SequenceStateCheckpointStoreTest, SerializesSequenceOperations)
+{
+  std::unique_ptr<SequenceStateCheckpointExecutor> executor;
+  ASSERT_TRUE(SequenceStateCheckpointExecutor::Create(
+                  std::move(store_), {2, 4, 4 * 1024 * 1024}, &executor)
+                  .IsOk());
+  ASSERT_TRUE(executor->SubmitSave("42", Snapshot()).IsOk());
+  EXPECT_EQ(
+      executor->SubmitRemove("42").StatusCode(), Status::Code::UNAVAILABLE);
+  EXPECT_EQ(executor->SubmitLoad("42").StatusCode(), Status::Code::UNAVAILABLE);
+  ASSERT_TRUE(executor->SubmitSave("43", Snapshot()).IsOk());
+  executor->Shutdown();
+  const auto statistics = executor->GetStatistics();
+  EXPECT_EQ(statistics.completion_count_, 2);
+  EXPECT_GT(statistics.reserved_byte_size_, 0);
+  SequenceStateCheckpointExecutor::Completion completion;
+  while (executor->PopCompletion(&completion)) {
+    EXPECT_TRUE(completion.status_.IsOk());
+    EXPECT_FALSE(completion.durability_uncertain_);
+  }
+  EXPECT_EQ(executor->GetStatistics().reserved_byte_size_, 0);
+}
+
+TEST_F(SequenceStateCheckpointStoreTest, AccountsOnlyPublishedCheckpoints)
+{
+  ASSERT_TRUE(store_->Save("old", Snapshot()).IsOk());
+  std::unique_ptr<SequenceStateCheckpointExecutor> executor;
+  ASSERT_TRUE(SequenceStateCheckpointExecutor::Create(
+                  std::move(store_), {2, 4, 4 * 1024 * 1024}, &executor)
+                  .IsOk());
+  ASSERT_TRUE(executor->SubmitSave("new", Snapshot()).IsOk());
+  SequenceStateCheckpointExecutor::Completion completion;
+  ASSERT_TRUE(WaitForCompletion(executor.get(), &completion));
+  ASSERT_TRUE(completion.status_.IsOk());
+  const size_t published_size = completion.checkpoint_byte_size_;
+  ASSERT_TRUE(executor->SubmitRemove("old").IsOk());
+  ASSERT_TRUE(WaitForCompletion(executor.get(), &completion));
+  ASSERT_TRUE(completion.status_.IsOk());
+  EXPECT_EQ(executor->GetStatistics().stored_byte_size_, published_size);
+}
+
+TEST_F(SequenceStateCheckpointStoreTest, JoinsConcurrentShutdown)
+{
+  std::unique_ptr<SequenceStateCheckpointExecutor> executor;
+  ASSERT_TRUE(SequenceStateCheckpointExecutor::Create(
+                  std::move(store_), {2, 16, 1024 * 1024}, &executor)
+                  .IsOk());
+  for (size_t i = 0; i < 16; ++i) {
+    ASSERT_TRUE(executor->SubmitSave(std::to_string(i), Snapshot()).IsOk());
+  }
+  size_t completed[2] = {};
+  auto shutdown = [&](size_t index) {
+    executor->Shutdown();
+    completed[index] = executor->GetStatistics().completion_count_;
+  };
+  std::thread first(shutdown, 0);
+  std::thread second(shutdown, 1);
+  first.join();
+  second.join();
+  EXPECT_EQ(completed[0], 16);
+  EXPECT_EQ(completed[1], 16);
 }
 
 }}}  // namespace triton::core
