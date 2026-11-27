@@ -188,6 +188,12 @@ SequenceBatchScheduler::Update(
 {
   std::lock_guard<std::mutex> lk(mu_);
 
+  if (!paused_sequences_.empty()) {
+    return Status(
+        Status::Code::UNAVAILABLE,
+        "cannot update model instances while sequence admission is paused");
+  }
+
   // Add the new batchers.
   RETURN_IF_ERROR(CreateBatchers(added_instances));
 
@@ -661,6 +667,59 @@ SequenceBatchScheduler::CreateBooleanControlTensors(
 }
 
 Status
+SequenceBatchScheduler::PauseSequenceAdmission(
+    const InferenceRequest::SequenceId& sequence_id, BatcherSequenceSlot* slot)
+{
+  if (slot == nullptr) {
+    return Status(Status::Code::INVALID_ARG, "sequence slot must not be null");
+  }
+  std::unique_lock<std::shared_mutex> admission_lock(admission_mu_);
+  std::lock_guard<std::mutex> lock(mu_);
+  if (stop_) {
+    return Status(Status::Code::UNAVAILABLE, "sequence scheduler is stopping");
+  }
+  const auto& config = model_->Config().sequence_batching();
+  if ((batchers_.size() != 1) || !pending_removal_seq_slots_.empty() ||
+      config.has_oldest() || config.iterative_sequence() ||
+      state_output_config_map_.empty()) {
+    return Status(
+        Status::Code::UNSUPPORTED,
+        "sequence checkpointing requires one stable Direct batcher with "
+        "non-iterative implicit state");
+  }
+  const auto it = sequence_to_batcherseqslot_map_.find(sequence_id);
+  if (it == sequence_to_batcherseqslot_map_.end()) {
+    return Status(Status::Code::NOT_FOUND, "sequence has no active slot");
+  }
+  if (!paused_sequences_.insert(sequence_id).second) {
+    return Status(
+        Status::Code::ALREADY_EXISTS, "sequence admission is already paused");
+  }
+  *slot = it->second;
+  return Status::Success;
+}
+
+Status
+SequenceBatchScheduler::ResumeSequenceAdmission(
+    const InferenceRequest::SequenceId& sequence_id)
+{
+  std::lock_guard<std::mutex> lock(mu_);
+  if (stop_) {
+    return Status(Status::Code::UNAVAILABLE, "sequence scheduler is stopping");
+  }
+  if (paused_sequences_.erase(sequence_id) == 0) {
+    return Status(Status::Code::NOT_FOUND, "sequence admission is not paused");
+  }
+  if (sequence_to_batcherseqslot_map_.find(sequence_id) ==
+      sequence_to_batcherseqslot_map_.end()) {
+    return Status(
+        Status::Code::NOT_FOUND, "sequence ended while admission was paused");
+  }
+  correlation_id_timestamps_[sequence_id] = Now<std::chrono::microseconds>();
+  return Status::Success;
+}
+
+Status
 SequenceBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& irequest)
 {
   // Queue timer starts at the beginning of the queueing and
@@ -696,7 +755,17 @@ SequenceBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& irequest)
 
   bool wake_reaper_thread = false;
 
+  std::shared_lock<std::shared_mutex> admission_lock(
+      admission_mu_, std::defer_lock);
+  if (!model_->Config().sequence_batching().iterative_sequence() &&
+      !model_->Config().sequence_batching().has_oldest()) {
+    admission_lock.lock();
+  }
   std::unique_lock<std::mutex> lock(mu_);
+
+  if (paused_sequences_.find(correlation_id) != paused_sequences_.end()) {
+    return Status(Status::Code::UNAVAILABLE, "sequence admission is paused");
+  }
 
   // Check if the request is one of the in-flight sequence (not starting new
   // sequence), we consider sequences in backlog as also in-flight.
@@ -1061,6 +1130,11 @@ SequenceBatchScheduler::ReaperThread(const int nice)
         std::unique_lock<std::mutex> lock(mu_);
         for (auto cid_itr = correlation_id_timestamps_.cbegin();
              cid_itr != correlation_id_timestamps_.cend();) {
+          if (paused_sequences_.find(cid_itr->first) !=
+              paused_sequences_.end()) {
+            ++cid_itr;
+            continue;
+          }
           int64_t remaining_microseconds =
               (int64_t)max_sequence_idle_microseconds_ -
               (now_us - cid_itr->second);

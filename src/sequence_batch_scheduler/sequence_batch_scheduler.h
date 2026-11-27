@@ -32,8 +32,10 @@
 #include <limits>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "backend_model.h"
 #include "backend_model_instance.h"
@@ -77,7 +79,11 @@ class SequenceBatchScheduler : public Scheduler {
   }
 
   // \see Scheduler::Stop()
-  void Stop() override { stop_ = true; }
+  void Stop() override
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    stop_ = true;
+  }
 
   // Update the scheduler to the new set of model instances. This function
   // cannot be called concurrently.
@@ -98,6 +104,15 @@ class SequenceBatchScheduler : public Scheduler {
     TritonModelInstance* model_instance_;
     uint32_t seq_slot_;
   };
+
+  // On success, prior admissions have reached the batcher. Execution may
+  // still be in flight; the caller must drain the slot before copying state.
+  // Cancellation may release the slot; revalidate its ID in the batcher.
+  Status PauseSequenceAdmission(
+      const InferenceRequest::SequenceId& sequence_id,
+      BatcherSequenceSlot* slot);
+  Status ResumeSequenceAdmission(
+      const InferenceRequest::SequenceId& sequence_id);
 
   // Fill a sequence slot with a sequence from the backlog or show
   // that the sequence slot is no longer being used.
@@ -199,6 +214,9 @@ class SequenceBatchScheduler : public Scheduler {
 
   // Mutex
   std::mutex mu_;
+  // Acquire before mu_; never acquire from a batcher callback.
+  std::shared_mutex admission_mu_;
+  std::unordered_set<InferenceRequest::SequenceId> paused_sequences_;
 
   // The reaper thread
   std::unique_ptr<std::thread> reaper_thread_;
