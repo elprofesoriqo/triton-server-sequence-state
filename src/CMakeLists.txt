@@ -149,6 +149,7 @@ set(
   repo_agent.cc
   scheduler_utils.cc
   sequence_batch_scheduler/sequence_batch_scheduler.cc
+  sequence_batch_scheduler/sequence_checkpoint.cc
   sequence_batch_scheduler/sequence_utils.cc
   sequence_state.cc
   sequence_state_checkpoint_executor.cc

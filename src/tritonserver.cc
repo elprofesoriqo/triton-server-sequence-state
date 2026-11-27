@@ -2895,6 +2895,42 @@ TRITONSERVER_ServerMetadata(
 }
 
 TRITONAPI_DECLSPEC TRITONSERVER_Error*
+TRITONSERVER_ServerSequenceCheckpoint(
+    TRITONSERVER_Server* server, const char* model_name, int64_t model_version,
+    uint64_t numeric_sequence_id, const char* string_sequence_id,
+    TRITONSERVER_SequenceCheckpointOperation operation,
+    TRITONSERVER_SequenceCheckpointCompleteFn_t complete_fn, void* userp)
+{
+  if ((server == nullptr) || (model_name == nullptr) ||
+      (complete_fn == nullptr)) {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INVALID_ARG, "invalid checkpoint arguments");
+  }
+  auto* lserver = reinterpret_cast<tc::InferenceServer*>(server);
+  std::shared_ptr<tc::Model> model;
+  RETURN_IF_STATUS_ERROR(lserver->GetModel(model_name, model_version, &model));
+  const auto id =
+      string_sequence_id == nullptr
+          ? tc::InferenceRequest::SequenceId(numeric_sequence_id)
+          : tc::InferenceRequest::SequenceId(std::string(string_sequence_id));
+  RETURN_IF_STATUS_ERROR(model->SequenceCheckpoint(
+      operation, id, model,
+      [complete_fn, userp](const tc::Status& status, const std::string& json) {
+        auto* error = status.IsOk()
+                          ? nullptr
+                          : TRITONSERVER_ErrorNew(
+                                tc::StatusCodeToTritonCode(status.StatusCode()),
+                                status.Message().c_str());
+        auto* result =
+            json.empty() ? nullptr
+                         : reinterpret_cast<TRITONSERVER_Message*>(
+                               new tc::TritonServerMessage(std::string(json)));
+        complete_fn(error, result, userp);
+      }));
+  return nullptr;
+}
+
+TRITONAPI_DECLSPEC TRITONSERVER_Error*
 TRITONSERVER_ServerModelMetadata(
     TRITONSERVER_Server* server, const char* model_name,
     const int64_t model_version, TRITONSERVER_Message** model_metadata)

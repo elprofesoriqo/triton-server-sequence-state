@@ -172,6 +172,7 @@ SequenceBatchScheduler::Create(
 
   // Create a batcher for each instance.
   RETURN_IF_ERROR(sched->CreateBatchers(new_instances));
+  RETURN_IF_ERROR(sched->ConfigureCheckpointing());
 
   // Create background threads that watch for different sequence states.
   sched->StartBackgroundThreads();
@@ -188,7 +189,7 @@ SequenceBatchScheduler::Update(
 {
   std::lock_guard<std::mutex> lk(mu_);
 
-  if (!paused_sequences_.empty()) {
+  if (CheckpointEnabled() || !paused_sequences_.empty()) {
     return Status(
         Status::Code::UNAVAILABLE,
         "cannot update model instances while sequence admission is paused");
@@ -673,6 +674,10 @@ SequenceBatchScheduler::PauseSequenceAdmission(
   if (slot == nullptr) {
     return Status(Status::Code::INVALID_ARG, "sequence slot must not be null");
   }
+  if (!CheckpointEnabled()) {
+    return Status(
+        Status::Code::UNSUPPORTED, "sequence checkpointing is disabled");
+  }
   std::unique_lock<std::shared_mutex> admission_lock(admission_mu_);
   std::lock_guard<std::mutex> lock(mu_);
   if (stop_) {
@@ -757,7 +762,8 @@ SequenceBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& irequest)
 
   std::shared_lock<std::shared_mutex> admission_lock(
       admission_mu_, std::defer_lock);
-  if (!model_->Config().sequence_batching().iterative_sequence() &&
+  if (CheckpointEnabled() &&
+      !model_->Config().sequence_batching().iterative_sequence() &&
       !model_->Config().sequence_batching().has_oldest()) {
     admission_lock.lock();
   }
@@ -925,6 +931,25 @@ SequenceBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& irequest)
                  << ": " << irequest->ModelName();
   batchers_[model_instance]->Enqueue(seq_slot, correlation_id, irequest);
   return Status::Success;
+}
+
+InferenceRequest::SequenceId
+SequenceBatchScheduler::ReleaseCheckpointSlot(
+    const BatcherSequenceSlot& slot,
+    const InferenceRequest::SequenceId& sequence_id,
+    std::deque<std::unique_ptr<InferenceRequest>>* requests)
+{
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = sequence_to_batcherseqslot_map_.find(sequence_id);
+    if ((it != sequence_to_batcherseqslot_map_.end()) &&
+        (it->second.model_instance_ == slot.model_instance_) &&
+        (it->second.seq_slot_ == slot.seq_slot_)) {
+      sequence_to_batcherseqslot_map_.erase(it);
+      correlation_id_timestamps_.erase(sequence_id);
+    }
+  }
+  return ReleaseSequenceSlot(slot, requests);
 }
 
 void
@@ -1515,9 +1540,9 @@ DirectSequenceBatch::DirectSequenceBatch(
           has_optional_input, start_input_overrides, end_input_overrides,
           startend_input_overrides, continue_input_overrides,
           notready_input_overrides),
-      scheduler_thread_exit_(false), scheduler_idle_(false),
-      queues_(seq_slot_cnt), seq_slot_correlation_ids_(seq_slot_cnt, 0),
-      max_active_seq_slot_(-1)
+      state_inflight_(seq_slot_cnt, 0), scheduler_thread_exit_(false),
+      scheduler_idle_(false), exec_complete_(true), queues_(seq_slot_cnt),
+      seq_slot_correlation_ids_(seq_slot_cnt, 0), max_active_seq_slot_(-1)
 {
   // Initialize to handle CORRID control. If error just exit
   // now... that means the corresponding model instance will not have
@@ -1551,7 +1576,7 @@ DirectSequenceBatch::~DirectSequenceBatch()
     std::unique_lock<std::mutex> lk(mu_);
     queues_cv_.wait(lk, [this] {
       for (uint32_t seq_slot = 0; seq_slot < queues_.size(); seq_slot++) {
-        if (!queues_[seq_slot].empty()) {
+        if (!queues_[seq_slot].empty() || (state_inflight_[seq_slot] != 0)) {
           LOG_VERBOSE(1) << "Waiting for slot " << seq_slot
                          << " to begin execution before exiting";
           return false;
@@ -1588,6 +1613,72 @@ DirectSequenceBatch::~DirectSequenceBatch()
   if (scheduler_thread_->joinable()) {
     scheduler_thread_->join();
   }
+}
+
+Status
+DirectSequenceBatch::CheckpointState(
+    StateOperation operation, uint32_t slot,
+    const InferenceRequest::SequenceId& sequence_id,
+    SequenceStateSnapshot* snapshot)
+{
+  auto command = std::make_unique<StateCommand>();
+  command->operation_ = operation;
+  command->slot_ = slot;
+  command->sequence_id_ = sequence_id;
+  command->snapshot_ = snapshot;
+  auto result = command->result_.get_future();
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (scheduler_thread_exit_ || (slot >= queues_.size())) {
+      return Status(Status::Code::UNAVAILABLE, "sequence batcher is stopping");
+    }
+    if (!state_commands_.empty()) {
+      return Status(
+          Status::Code::UNAVAILABLE, "a sequence state command is pending");
+    }
+    state_commands_.emplace_back(std::move(command));
+  }
+  cv_.notify_one();
+  return result.get();
+}
+
+Status
+DirectSequenceBatch::ExecuteStateCommand(StateCommand& command)
+{
+  const auto slot = command.slot_;
+  auto& states = sequence_states_[slot];
+  auto& id = seq_slot_correlation_ids_[slot];
+  if (command.operation_ == StateOperation::RESTORE) {
+    if (id.InSequence()) {
+      return Status(Status::Code::UNAVAILABLE, "sequence slot is occupied");
+    }
+    auto restored = std::make_shared<SequenceStates>();
+    RETURN_IF_ERROR(restored->Initialize(
+        base_->StateOutputConfigMap(), base_->MaxBatchSize(),
+        base_->InitialState(), model_instance_->Kind(),
+        model_instance_->DeviceId(),
+        model_instance_->Model()->Server()->CudaVirtualAddressSpaceSize()));
+    RETURN_IF_ERROR(command.snapshot_->Restore(restored.get()));
+    states = std::move(restored);
+    id = command.sequence_id_;
+    max_active_seq_slot_ = std::max(max_active_seq_slot_, int32_t(slot));
+    return Status::Success;
+  }
+  if ((id != command.sequence_id_) || (states == nullptr)) {
+    return Status(Status::Code::NOT_FOUND, "sequence no longer owns the slot");
+  }
+  if (command.operation_ == StateOperation::CAPTURE) {
+    return SequenceStateSnapshot::Capture(
+        *states, command.snapshot_, &base_->CheckpointLayout());
+  }
+  if (states.use_count() != 1) {
+    return Status(
+        Status::Code::UNAVAILABLE, "sequence state is still referenced");
+  }
+  states.reset();
+  id = base_->ReleaseCheckpointSlot(
+      {model_instance_, slot}, command.sequence_id_, &queues_[slot]);
+  return Status::Success;
 }
 
 void
@@ -1642,8 +1733,6 @@ DirectSequenceBatch::BatcherThread(const int nice)
   }
 
   const uint64_t default_wait_microseconds = 500 * 1000;
-  exec_complete_ = true;
-
   // When there is optional input or input shape must be enforced,
   // the inputs in the requests must be examined for forming a batch
   const bool check_input =
@@ -1661,6 +1750,17 @@ DirectSequenceBatch::BatcherThread(const int nice)
     // Hold the lock for as short a time as possible.
     {
       std::unique_lock<std::mutex> lock(mu_);
+
+      for (auto it = state_commands_.begin(); it != state_commands_.end();) {
+        auto& command = **it;
+        if (!queues_[command.slot_].empty() ||
+            (state_inflight_[command.slot_] != 0)) {
+          ++it;
+          continue;
+        }
+        command.result_.set_value(ExecuteStateCommand(command));
+        it = state_commands_.erase(it);
+      }
 
       if (delay_cnt > 0) {
         wait_microseconds = 10 * 1000;
@@ -1866,6 +1966,37 @@ DirectSequenceBatch::BatcherThread(const int nice)
             // Update the implicit state and set the input state tensors.
             UpdateImplicitState(irequest, seq_slot);
 
+            if (base_->CheckpointEnabled()) {
+              ++state_inflight_[seq_slot];
+              irequest->AddInternalReleaseCallback(
+                  [this, seq_slot](
+                      std::unique_ptr<InferenceRequest>& request,
+                      const uint32_t flags) -> Status {
+                    if (flags & TRITONSERVER_REQUEST_RELEASE_ALL) {
+                      const auto& states = request->GetSequenceStates();
+                      if (states != nullptr) {
+                        for (const auto& state : states->InputStates()) {
+                          const auto input =
+                              request->MutableOverrideInputs()->find(
+                                  state.first);
+                          if (input !=
+                              request->MutableOverrideInputs()->end()) {
+                            RETURN_IF_ERROR(input->second->RemoveAllData());
+                          }
+                        }
+                      }
+                      request->SetSequenceStates(nullptr);
+                      {
+                        std::lock_guard<std::mutex> lock(mu_);
+                        --state_inflight_[seq_slot];
+                      }
+                      cv_.notify_one();
+                      queues_cv_.notify_all();
+                    }
+                    return Status::Success;
+                  });
+            }
+
             if ((irequest->Flags() & TRITONSERVER_REQUEST_FLAG_SEQUENCE_END) !=
                 0) {
               end_of_sequence = true;
@@ -1930,7 +2061,10 @@ DirectSequenceBatch::BatcherThread(const int nice)
 
     if (curr_payload_->GetState() == Payload::State::READY) {
       // Add callback to signal the execution completion
-      exec_complete_ = false;
+      {
+        std::lock_guard<std::mutex> lock(payload_mu_);
+        exec_complete_ = false;
+      }
       auto callback = [this]() {
         {
           std::unique_lock<std::mutex> lk(payload_mu_);

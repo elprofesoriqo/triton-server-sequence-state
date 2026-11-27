@@ -92,7 +92,7 @@ struct TRITONSERVER_MetricArgs;
 ///   }
 ///
 #define TRITONSERVER_API_VERSION_MAJOR 1
-#define TRITONSERVER_API_VERSION_MINOR 34
+#define TRITONSERVER_API_VERSION_MINOR 35
 
 /// Get the TRITONBACKEND API version supported by the Triton shared
 /// library. This value can be compared against the
@@ -2485,15 +2485,39 @@ TRITONSERVER_DECLSPEC struct TRITONSERVER_Error* TRITONSERVER_ServerMetadata(
     struct TRITONSERVER_Server* server,
     struct TRITONSERVER_Message** server_metadata);
 
+typedef enum TRITONSERVER_sequencecheckpointoperation_enum {
+  TRITONSERVER_SEQUENCE_CHECKPOINT_SUSPEND,
+  TRITONSERVER_SEQUENCE_CHECKPOINT_RESUME,
+  TRITONSERVER_SEQUENCE_CHECKPOINT_DISCARD,
+  TRITONSERVER_SEQUENCE_CHECKPOINT_STATUS
+} TRITONSERVER_SequenceCheckpointOperation;
+
+/// Completion owns error and result and must delete them when non-null.
+/// Callbacks must not synchronously unload the model or delete the server.
+typedef void (*TRITONSERVER_SequenceCheckpointCompleteFn_t)(
+    struct TRITONSERVER_Error* error, struct TRITONSERVER_Message* result,
+    void* userp);
+
+/// Submit a sequence checkpoint operation. On success, completion is called
+/// exactly once. On admission failure, completion is not called.
+/// A non-null string_sequence_id selects a string ID; otherwise numeric ID
+/// is used. The model must configure sequence checkpointing. Management
+/// operations execute serially on a bounded queue. Inference remains
+/// asynchronous. Status completion can run inline; other completions run on a
+/// management thread. A completion may submit the next operation.
+TRITONSERVER_DECLSPEC struct TRITONSERVER_Error*
+TRITONSERVER_ServerSequenceCheckpoint(
+    struct TRITONSERVER_Server* server, const char* model_name,
+    int64_t model_version, uint64_t numeric_sequence_id,
+    const char* string_sequence_id,
+    TRITONSERVER_SequenceCheckpointOperation operation,
+    TRITONSERVER_SequenceCheckpointCompleteFn_t complete_fn, void* userp);
+
 /// Get the metadata of a model as a TRITONSERVER_Message
-/// object.  The caller takes ownership of the message object and must
-/// call TRITONSERVER_MessageDelete to release the object.
-///
-/// \param server The inference server object.
+/// object. The caller owns the message and must call
+/// TRITONSERVER_MessageDelete. \param server The inference server object.
 /// \param model_name The name of the model.
-/// \param model_version The version of the model.
-/// If -1 then the server will choose a version based on the model's
-/// policy.
+/// \param model_version The model version, or -1 to use the version policy.
 /// \param model_metadata Returns the model metadata message.
 /// \return a TRITONSERVER_Error indicating success or failure.
 TRITONSERVER_DECLSPEC struct TRITONSERVER_Error*

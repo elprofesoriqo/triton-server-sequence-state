@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+// Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -31,10 +31,22 @@
 #include "status.h"
 
 namespace triton { namespace core {
+class Model;
 
 // Scheduler interface.
 class Scheduler {
  public:
+  using CheckpointCompleteFn =
+      std::function<void(const Status&, const std::string&)>;
+  virtual Status SequenceCheckpoint(
+      TRITONSERVER_SequenceCheckpointOperation operation,
+      InferenceRequest::SequenceId sequence_id, std::shared_ptr<Model> model,
+      CheckpointCompleteFn complete)
+  {
+    return Status(
+        Status::Code::UNSUPPORTED,
+        "model does not support sequence checkpointing");
+  }
   virtual ~Scheduler() {}
 
   // The prototype for the initialization function that will be called

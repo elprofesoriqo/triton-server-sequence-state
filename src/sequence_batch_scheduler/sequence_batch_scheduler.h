@@ -1,4 +1,4 @@
-// Copyright 2018-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -44,6 +44,8 @@
 #include "scheduler.h"
 #include "scheduler_utils.h"
 #include "sequence_state.h"
+#include "sequence_state_checkpoint_executor.h"
+#include "sequence_state_snapshot.h"
 #include "sequence_utils.h"
 #include "status.h"
 #include "triton/common/model_config.h"
@@ -57,6 +59,15 @@ class SequenceBatch;
 class SequenceBatchScheduler : public Scheduler {
  public:
   using ControlInputs = std::vector<std::shared_ptr<InferenceRequest::Input>>;
+  bool CheckpointEnabled() const { return checkpoint_executor_ != nullptr; }
+  const std::vector<SequenceStateSnapshot::Tensor>& CheckpointLayout() const
+  {
+    return checkpoint_layout_;
+  }
+  Status SequenceCheckpoint(
+      TRITONSERVER_SequenceCheckpointOperation operation,
+      InferenceRequest::SequenceId sequence_id, std::shared_ptr<Model> model,
+      CheckpointCompleteFn complete) override;
 
   ~SequenceBatchScheduler();
 
@@ -75,7 +86,15 @@ class SequenceBatchScheduler : public Scheduler {
   size_t InflightInferenceCount() override
   {
     std::unique_lock<std::mutex> lock(mu_);
-    return sequence_to_batcherseqslot_map_.size();
+    size_t count = sequence_to_batcherseqslot_map_.size();
+    // Fenced sequences have drained and cannot accept further inference.
+    for (const auto& entry : checkpoints_) {
+      if ((entry.second.phase_ == CheckpointPhase::ERROR) &&
+          (sequence_to_batcherseqslot_map_.count(entry.first) != 0)) {
+        --count;
+      }
+    }
+    return count + (checkpoint_busy_ ? 1 : 0);
   }
 
   // \see Scheduler::Stop()
@@ -113,6 +132,10 @@ class SequenceBatchScheduler : public Scheduler {
       BatcherSequenceSlot* slot);
   Status ResumeSequenceAdmission(
       const InferenceRequest::SequenceId& sequence_id);
+  InferenceRequest::SequenceId ReleaseCheckpointSlot(
+      const BatcherSequenceSlot& slot,
+      const InferenceRequest::SequenceId& sequence_id,
+      std::deque<std::unique_ptr<InferenceRequest>>* requests);
 
   // Fill a sequence slot with a sequence from the backlog or show
   // that the sequence slot is no longer being used.
@@ -143,6 +166,38 @@ class SequenceBatchScheduler : public Scheduler {
   Sequencer* SequencerPtr() { return sequencer_.get(); }
 
  private:
+  enum class CheckpointPhase { SUSPENDING, SUSPENDED, RESUMING, ERROR };
+  struct CheckpointRecord {
+    CheckpointPhase phase_;
+    size_t bytes_;
+    std::string error_;
+  };
+  Status ConfigureCheckpointing();
+  Status RunCheckpointOperation(
+      TRITONSERVER_SequenceCheckpointOperation operation,
+      const InferenceRequest::SequenceId& id);
+  Status CheckpointStatus(
+      const InferenceRequest::SequenceId& id, std::string* json);
+  std::unique_ptr<SequenceStateCheckpointExecutor> checkpoint_executor_;
+  std::unordered_map<InferenceRequest::SequenceId, CheckpointRecord>
+      checkpoints_;
+  std::atomic<bool> checkpoint_busy_{false};
+  struct CheckpointControl {
+    TRITONSERVER_SequenceCheckpointOperation operation_;
+    InferenceRequest::SequenceId id_;
+    CheckpointCompleteFn complete_;
+  };
+  std::mutex checkpoint_control_mu_;
+  std::deque<CheckpointControl> checkpoint_controls_;
+  size_t checkpoint_max_controls_{0};
+  bool checkpoint_fenced_{false};
+  size_t checkpoint_max_count_{0};
+  size_t checkpoint_max_bytes_{0};
+  size_t checkpoint_count_{0};
+  size_t checkpoint_bytes_{0};
+  size_t checkpoint_file_limit_{0};
+  size_t checkpoint_base_bytes_{0};
+  std::vector<SequenceStateSnapshot::Tensor> checkpoint_layout_;
   SequenceBatchScheduler(
       TritonModel* model,
       const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors)
@@ -391,6 +446,12 @@ class SequenceBatch {
 // for a model instance.
 class DirectSequenceBatch : public SequenceBatch {
  public:
+  enum class StateOperation { CAPTURE, RELEASE, RESTORE };
+  // Called by the management worker, never from a backend callback.
+  Status CheckpointState(
+      StateOperation operation, uint32_t slot,
+      const InferenceRequest::SequenceId& sequence_id,
+      SequenceStateSnapshot* snapshot);
   DirectSequenceBatch(
       SequenceBatchScheduler* base, TritonModelInstance* model_instance,
       const size_t seq_slot_cnt,
@@ -415,6 +476,16 @@ class DirectSequenceBatch : public SequenceBatch {
       std::unique_ptr<InferenceRequest>& request) override;
 
  private:
+  struct StateCommand {
+    StateOperation operation_;
+    uint32_t slot_;
+    InferenceRequest::SequenceId sequence_id_;
+    SequenceStateSnapshot* snapshot_;
+    std::promise<Status> result_;
+  };
+  Status ExecuteStateCommand(StateCommand& command);
+  std::deque<std::unique_ptr<StateCommand>> state_commands_;
+  std::vector<size_t> state_inflight_;
   void BatcherThread(const int nice);
   void NewPayload();
 

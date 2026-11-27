@@ -603,6 +603,10 @@ TRITONSERVER_ServerMetadata()
 {
 }
 TRITONAPI_DECLSPEC void
+TRITONSERVER_ServerSequenceCheckpoint()
+{
+}
+TRITONAPI_DECLSPEC void
 TRITONSERVER_ServerModelMetadata()
 {
 }
