@@ -85,6 +85,9 @@ set(
 )
 
 # Sequence state checkpointing
+add_library(sequence_checkpoint_io_faults SHARED sequence_checkpoint_io_faults.cc)
+target_link_libraries(sequence_checkpoint_io_faults PRIVATE dl)
+
 add_executable(
   sequence_state_snapshot_test
   sequence_state_checkpoint_store_test.cc
