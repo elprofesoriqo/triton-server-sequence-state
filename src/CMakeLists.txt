@@ -151,6 +151,7 @@ set(
   sequence_batch_scheduler/sequence_batch_scheduler.cc
   sequence_batch_scheduler/sequence_utils.cc
   sequence_state.cc
+  sequence_state_checkpoint_executor.cc
   sequence_state_checkpoint_store.cc
   sequence_state_snapshot.cc
   server.cc
@@ -203,6 +204,7 @@ set(
   sequence_batch_scheduler/sequence_batch_scheduler.h
   sequence_batch_scheduler/sequence_utils.h
   sequence_state.h
+  sequence_state_checkpoint_executor.h
   sequence_state_checkpoint_store.h
   sequence_state_snapshot.h
   server.h

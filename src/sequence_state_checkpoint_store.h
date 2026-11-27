@@ -49,11 +49,16 @@ class SequenceStateCheckpointStore {
       delete;
 
   Status Save(
-      const std::string& sequence_id,
-      const SequenceStateSnapshot& snapshot) const;
+      const std::string& sequence_id, const SequenceStateSnapshot& snapshot,
+      size_t* checkpoint_byte_size = nullptr) const;
   Status Load(
-      const std::string& sequence_id, SequenceStateSnapshot* snapshot) const;
-  Status Remove(const std::string& sequence_id) const;
+      const std::string& sequence_id, SequenceStateSnapshot* snapshot,
+      size_t* checkpoint_byte_size = nullptr) const;
+  Status Remove(
+      const std::string& sequence_id,
+      size_t* checkpoint_byte_size = nullptr) const;
+
+  size_t MaxCheckpointByteSize() const { return max_checkpoint_byte_size_; }
 
  private:
   SequenceStateCheckpointStore(

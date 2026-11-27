@@ -345,10 +345,9 @@ ParseMetadata(
       return StoreError(Status::Code::INVALID_ARG, "state layout is invalid");
     }
 
-    parsed.emplace_back(
-        SequenceStateSnapshot::Tensor{
-            std::move(name), data_type, std::move(shape), payload_offset,
-            static_cast<size_t>(tensor_byte_size)});
+    parsed.emplace_back(SequenceStateSnapshot::Tensor{
+        std::move(name), data_type, std::move(shape), payload_offset,
+        static_cast<size_t>(tensor_byte_size)});
     payload_offset += static_cast<size_t>(tensor_byte_size);
     previous_name = parsed.back().input_name_;
   }
@@ -429,7 +428,8 @@ SequenceStateCheckpointStore::CheckpointName(
 
 Status
 SequenceStateCheckpointStore::Save(
-    const std::string& sequence_id, const SequenceStateSnapshot& snapshot) const
+    const std::string& sequence_id, const SequenceStateSnapshot& snapshot,
+    size_t* checkpoint_byte_size) const
 {
   std::string checkpoint_name;
   RETURN_IF_ERROR(CheckpointName(sequence_id, &checkpoint_name));
@@ -437,13 +437,10 @@ SequenceStateCheckpointStore::Save(
   size_t metadata_byte_size = 0;
   RETURN_IF_ERROR(SnapshotMetadataSize(
       snapshot, sequence_id, model_name_, &metadata_byte_size));
-  size_t checkpoint_byte_size = kHeaderByteSize;
-  if (!AddSize(
-          checkpoint_byte_size, metadata_byte_size, &checkpoint_byte_size) ||
-      !AddSize(
-          checkpoint_byte_size, snapshot.Data().size(),
-          &checkpoint_byte_size) ||
-      (checkpoint_byte_size > max_checkpoint_byte_size_)) {
+  size_t total_byte_size = kHeaderByteSize;
+  if (!AddSize(total_byte_size, metadata_byte_size, &total_byte_size) ||
+      !AddSize(total_byte_size, snapshot.Data().size(), &total_byte_size) ||
+      (total_byte_size > max_checkpoint_byte_size_)) {
     return StoreError(
         Status::Code::INVALID_ARG, "checkpoint exceeds the configured limit");
   }
@@ -537,15 +534,22 @@ SequenceStateCheckpointStore::Save(
     return SystemError("publish checkpoint", error);
   }
   unlinkat(directory_fd_, temporary_name.c_str(), 0);
+  if (checkpoint_byte_size != nullptr) {
+    *checkpoint_byte_size = total_byte_size;
+  }
   if (fsync(directory_fd_) != 0) {
-    return SystemError("synchronize checkpoint directory", errno);
+    return StoreError(
+        Status::Code::UNAVAILABLE,
+        "checkpoint published but directory durability is uncertain: " +
+            std::string(std::strerror(errno)));
   }
   return Status::Success;
 }
 
 Status
 SequenceStateCheckpointStore::Load(
-    const std::string& sequence_id, SequenceStateSnapshot* snapshot) const
+    const std::string& sequence_id, SequenceStateSnapshot* snapshot,
+    size_t* checkpoint_byte_size) const
 {
   if (snapshot == nullptr) {
     return StoreError(Status::Code::INVALID_ARG, "output must not be null");
@@ -652,11 +656,15 @@ SequenceStateCheckpointStore::Load(
   }
 
   *snapshot = std::move(loaded);
+  if (checkpoint_byte_size != nullptr) {
+    *checkpoint_byte_size = expected_file_size;
+  }
   return Status::Success;
 }
 
 Status
-SequenceStateCheckpointStore::Remove(const std::string& sequence_id) const
+SequenceStateCheckpointStore::Remove(
+    const std::string& sequence_id, size_t* checkpoint_byte_size) const
 {
   std::string checkpoint_name;
   RETURN_IF_ERROR(CheckpointName(sequence_id, &checkpoint_name));
@@ -677,8 +685,14 @@ SequenceStateCheckpointStore::Remove(const std::string& sequence_id) const
   if (unlinkat(directory_fd_, checkpoint_name.c_str(), 0) != 0) {
     return SystemError("remove checkpoint", errno);
   }
+  if (checkpoint_byte_size != nullptr) {
+    *checkpoint_byte_size = static_cast<size_t>(file_status.st_size);
+  }
   if (fsync(directory_fd_) != 0) {
-    return SystemError("synchronize checkpoint directory", errno);
+    return StoreError(
+        Status::Code::UNAVAILABLE,
+        "checkpoint removed but directory durability is uncertain: " +
+            std::string(std::strerror(errno)));
   }
   return Status::Success;
 }
